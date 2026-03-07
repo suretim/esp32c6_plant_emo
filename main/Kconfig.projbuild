@@ -1,0 +1,67 @@
+# plant_sensor_esp32/main/Kconfig.projbuild
+
+menu "Plant Sensor Configuration"
+
+    config ESP_WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            WiFi network name (SSID) to connect to.
+
+    config ESP_WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            WiFi network password.
+
+    config SENSOR_BUFFER_SIZE
+        int "Sensor buffer size"
+        default 1000
+        range 100 10000
+        help
+            Number of samples to store in circular buffer.
+            Larger buffer allows longer history but uses more RAM.
+
+    config SAMPLE_INTERVAL_MS
+        int "Sample interval (ms)"
+        default 100
+        range 10 10000
+        help
+            Time between sensor readings in milliseconds.
+            Lower values give higher resolution but more data.
+
+    config HTTP_SERVER_PORT
+        int "HTTP server port"
+        default 80
+        range 1 65535
+        help
+            Port for HTTP server. Default is 80 (standard HTTP).
+
+    config UART_BAUD_RATE
+        int "UART baud rate"
+        default 115200
+        range 9600 921600
+        help
+            Baud rate for UART output.
+
+    config UART_TX_PIN
+        int "UART TX pin"
+        default 1
+        range 0 39
+        help
+            GPIO pin number for UART TX.
+
+    config UART_RX_PIN
+        int "UART RX pin"
+        default 3
+        range 0 39
+        help
+            GPIO pin number for UART RX.
+
+    config ENABLE_UART_OUTPUT
+        bool "Enable UART output"
+        default y
+        help
+            Enable real-time data output via UART.
+
+endmenu

@@ -1,0 +1,24 @@
+# 忽略 build 文件夹
+build/
+
+# 忽略 .vscode 文件夹
+.vscode/
+.venv/ 
+
+# MacOS file
+.DS_Store
+
+managed_components/
+#partitions_table.csv
+#partitions.csv
+checkpoints/
+components/bsp/version.h.rej
+# Ignore generated model files
+dependencies.lock
+#variables.data-00000-of-00001
+*.bin
+*.npy
+*.npz
+*.h5
+*.jpg
+*.zip

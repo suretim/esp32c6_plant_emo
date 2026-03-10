@@ -1,6 +1,7 @@
 # plant_sensor_esp32/main/CMakeLists.txt
 idf_component_register(SRCS     
-                        "main_as7431.c"   
+                        "main_as7341.c" 
+                        "comprehensive_analysis.cc"  
                         "stepper_motor.c"
                     INCLUDE_DIRS "."
                     REQUIRES 

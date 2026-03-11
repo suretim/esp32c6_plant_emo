@@ -170,50 +170,100 @@ static esp_err_t as7343_read_regs(uint8_t reg, uint8_t *data, size_t len)
 // AS7343 初始化（正确的3-cycle配置）
 // ==============================
 
-static esp_err_t as7343_init_complete(void)
+static esp_err_t as7343_init(void)
 {
-    uint8_t id;
+    // 启用自动序列模式
+as7341_write_reg(AS7341_REG_CFG9, 0x10);  // AUTO_SMUX
+
+// 然后只需启动一次，AS7341 会自动完成 2-3 个周期
+as7341_write_reg(AS7341_REG_ENABLE, AS7341_ENABLE_PON | AS7341_ENABLE_SPEN | AS7341_ENABLE_SMUXEN);
+    return ESP_OK;
+}
+
+/**
+ * @brief 读取所有11通道（正确的双周期流程）
+ */
+static esp_err_t as7341_read_all_channels(sensor_data_t *data)
+{
+    uint8_t buffer[12];  // 6通道×2字节
     esp_err_t ret;
     
-    // 1. 读取ID
-    ret = as7343_read_reg(AS7343_REG_ID, &id);
-    if (ret != ESP_OK || id != 0x09) {
-        ESP_LOGE(TAG, "AS7343 not found, ID: 0x%02X", id);
-        //return ESP_FAIL;
+    // ---- Cycle 1: F1, F2, F3, F4, CLEAR, NIR ----
+    ret = as7341_configure_smux_cycle(true);  // true = F1-F4
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SMUX config Cycle 1 failed");
+        return ret;
     }
-    ESP_LOGI(TAG, "AS7343 ID: 0x%02X", id);
     
-    // 2. 软件复位
-    ret = as7343_write_reg(AS7343_REG_ENABLE, 0x06);
+    // 启动光谱测量（SP_EN=1）
+    uint8_t enable_val;
+    ret = as7341_read_reg(AS7341_REG_ENABLE, &enable_val);
     if (ret != ESP_OK) return ret;
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // 3. 【关键】配置为3-cycle模式
-    // CFG1: 3 cycles, auto sequence
-    ret = as7343_write_reg(AS7343_REG_CFG1, 0x30);  // 0x30 = 3 cycles
+    enable_val |= AS7341_ENABLE_SPEN;
+    ret = as7341_write_reg(AS7341_REG_ENABLE, enable_val);
     if (ret != ESP_OK) return ret;
     
-    // 4. 【关键】配置增益 (16x)
-    ret = as7343_write_reg(AS7343_REG_AGAIN, 0x05);
+    // 等待数据就绪（AVALID=1）
+    ret = as7341_wait_for_data(500);
     if (ret != ESP_OK) return ret;
     
-    // 5. 【关键】配置积分时间 (ATIME=50, ASTEP=999 = ~140ms per cycle)
-    // 总时间 = 3 cycles * 140ms = 420ms
-    ret = as7343_write_reg(AS7343_REG_ATIME, 50);
+    // 读取6通道数据
+    ret = as7341_read_regs(AS7341_REG_CH0_DATA_L, buffer, 12);
     if (ret != ESP_OK) return ret;
     
-    ret = as7343_write_reg(AS7343_REG_ASTEP_L, 0xE7);  // 231
+    // 解析Cycle 1
+    data->f1    = buffer[0]  | (buffer[1]  << 8);   // ADC0
+    data->f2    = buffer[2]  | (buffer[3]  << 8);   // ADC1
+    data->f3    = buffer[4]  | (buffer[5]  << 8);   // ADC2
+    data->f4    = buffer[6]  | (buffer[7]  << 8);   // ADC3
+    data->clear = buffer[8]  | (buffer[9]  << 8);   // ADC4
+    data->nir   = buffer[10] | (buffer[11] << 8);   // ADC5
+    
+    // 关闭SP_EN（为下一次SMUX配置做准备）
+    enable_val &= ~AS7341_ENABLE_SPEN;
+    ret = as7341_write_reg(AS7341_REG_ENABLE, enable_val);
     if (ret != ESP_OK) return ret;
     
-    ret = as7343_write_reg(AS7343_REG_ASTEP_H, 0x03);  // 3 -> total 999
+    // ---- Cycle 2: F5, F6, F7, F8, CLEAR, NIR ----
+    ret = as7341_configure_smux_cycle(false);  // false = F5-F8
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SMUX config Cycle 2 failed");
+        return ret;
+    }
+    
+    // 再次启动光谱测量
+    ret = as7341_read_reg(AS7341_REG_ENABLE, &enable_val);
+    if (ret != ESP_OK) return ret;
+    enable_val |= AS7341_ENABLE_SPEN;
+    ret = as7341_write_reg(AS7341_REG_ENABLE, enable_val);
     if (ret != ESP_OK) return ret;
     
-    // 6. 使能电源
-    ret = as7343_write_reg(AS7343_REG_ENABLE, AS7343_ENABLE_PON);
+    // 等待数据就绪
+    ret = as7341_wait_for_data(500);
     if (ret != ESP_OK) return ret;
-    vTaskDelay(pdMS_TO_TICKS(20));
     
-    ESP_LOGI(TAG, "AS7343 initialized (3-cycle mode)");
+    // 读取Cycle 2数据
+    ret = as7341_read_regs(AS7341_REG_CH0_DATA_L, buffer, 12);
+    if (ret != ESP_OK) return ret;
+    
+    // 解析Cycle 2
+    data->f5    = buffer[0]  | (buffer[1]  << 8);   // ADC0
+    data->f6    = buffer[2]  | (buffer[3]  << 8);   // ADC1
+    data->f7    = buffer[4]  | (buffer[5]  << 8);   // ADC2
+    data->f8    = buffer[6]  | (buffer[7]  << 8);   // ADC3
+    // ADC4=CLEAR, ADC5=NIR（与Cycle 1相同，可验证一致性）
+    uint16_t clear2 = buffer[8]  | (buffer[9]  << 8);
+    uint16_t nir2   = buffer[10] | (buffer[11] << 8);
+    
+    // 验证CLEAR和NIR的一致性（可选）
+    if (abs((int)data->clear - (int)clear2) > 1000) {
+        ESP_LOGW(TAG, "Clear mismatch: %u vs %u", data->clear, clear2);
+    }
+    
+    // 关闭测量
+    enable_val &= ~AS7341_ENABLE_SPEN;
+    as7341_write_reg(AS7341_REG_ENABLE, enable_val);
+    
     return ESP_OK;
 }
 

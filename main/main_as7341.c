@@ -30,7 +30,7 @@
 #define TAG "AS7341"
 
 // WiFi配置
-#define SOFT_AP_SSID      "C6AS7341_1"
+#define SOFT_AP_SSID      "ESP32C6AS7341"
 #define SOFT_AP_PASSWORD  "88888888"
 #define SOFT_AP_MAX_CONN  4
 #define SOFT_AP_CHANNEL   1
@@ -238,14 +238,14 @@ static esp_err_t as7341_init(void)
     ret = as7341_read_reg(AS7341_REG_ID, &id);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read ID");
-        return ret;
+        //return ret;
     }
     
     ESP_LOGI(TAG, "AS7341 ID: 0x%02X", id);
     
     // 软件复位
     ret = as7341_write_reg(AS7341_REG_ENABLE, 0x06);
-    if (ret != ESP_OK) return ret;
+    //if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(10));
     
     // 配置增益 (1x)
@@ -291,14 +291,11 @@ static esp_err_t as7341_read_all_channels(sensor_data_t *data)
     uint8_t buffer[12];
     esp_err_t ret;
     
-    // ---- Cycle 1: F1-F6 ----
-    // 配置 SMUX (F1-F6 到 ADC0-ADC5)
-    for (int i = 0; i < 6; i++) {
-        as7341_write_reg(0x00 + i, 0x30 + i);  // F1-F6 → ADC0-ADC5
-    }
-    as7341_write_reg(0xAF, 0x10);  // 执行 SMUX
-    as7341_write_reg(AS7341_REG_ENABLE, 0x13);  // PON+SPEN+SMUXEN
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // Cycle 1
+    ret = as7341_write_reg(AS7341_REG_ENABLE, AS7341_ENABLE_PON | AS7341_ENABLE_SPEN | AS7341_ENABLE_SMUXEN);
+    if (ret != ESP_OK) return ret;
+    
+    vTaskDelay(pdMS_TO_TICKS(200));
     
     ret = as7341_read_regs(AS7341_REG_CH0_DATA_L, buffer, 12);
     if (ret != ESP_OK) return ret;
@@ -310,19 +307,15 @@ static esp_err_t as7341_read_all_channels(sensor_data_t *data)
     data->f5 = buffer[8] | (buffer[9] << 8);
     data->f6 = buffer[10] | (buffer[11] << 8);
     
-    // ---- Cycle 2: F7,F8,NIR,Clear ----
-    // 重新配置 SMUX
-    as7341_write_reg(0x00, 0x36);  // F7 → ADC0? 不对，应该是 0x36 是 F7
-    as7341_write_reg(0x01, 0x37);  // F8 → ADC1
-    as7341_write_reg(0x02, 0x38);  // NIR → ADC2  
-    as7341_write_reg(0x03, 0x39);  // Clear → ADC3
-    // ADC4-ADC5 禁用或映射到空
+    // Cycle 2
+    ret = as7341_write_reg(AS7341_REG_ENABLE, AS7341_ENABLE_PON | AS7341_ENABLE_SPEN | AS7341_ENABLE_SMUXEN);
+    if (ret != ESP_OK) return ret;
     
-    as7341_write_reg(0xAF, 0x10);  // 再次执行 SMUX
-    as7341_write_reg(AS7341_REG_ENABLE, 0x13);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(200));
     
     ret = as7341_read_regs(AS7341_REG_CH0_DATA_L, buffer, 12);
+    if (ret != ESP_OK) return ret;
+    
     data->f7 = buffer[0] | (buffer[1] << 8);
     data->f8 = buffer[2] | (buffer[3] << 8);
     data->nir = buffer[4] | (buffer[5] << 8);
@@ -442,67 +435,31 @@ static void sensor_task(void *pvParameters)
 // ==============================
 
 static esp_err_t latest_get_handler(httpd_req_t *req)
-{ 
-    int idx = 0;
-     
-    char buf[32];
-    int t=0;
-    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
-        char param[16];
-        if (httpd_query_key_value(buf, "idx", param, sizeof(param)) == ESP_OK) {
-            idx = atoi(param);
-        }
-        // 也可以解析 t 参数（时间戳/运行小时）
-        httpd_query_key_value(buf, "t", param, sizeof(param));
-        t= atoi(param);
-    }
+{
     sensor_data_t data = {0};
     
-
-
     if (xSemaphoreTake(g_data_mutex, portMAX_DELAY)) {
         data = g_latest_data;
         xSemaphoreGive(g_data_mutex);
     }
-     
     
-    char response[768];
-    
-    if (idx == 0) {
-        // AS7341: 返回完整的 11 通道光谱数据（对象格式）
-        snprintf(response, sizeof(response),
-            "{"
-            "\"cursor\":%lu,"
-            "\"f1\":%u,\"f2\":%u,\"f3\":%u,\"f4\":%u,"
-            "\"f5\":%u,\"f6\":%u,\"f7\":%u,\"f8\":%u,"
-            "\"nir\":%u,\"clear\":%u,"
-            "\"ci\":%.3f,"
-            "\"ppfd\":%.1f,\"par\":%.1f"
-            "}",
-            (unsigned long)data.cursor,
-            data.f1, data.f2, data.f3, data.f4,
-            data.f5, data.f6, data.f7, data.f8,
-            data.nir, data.clear,
-            data.ci,
-            data.ppfd_plant, data.ppfd_par);
-            
-    } 
-
-    else{
-     
- 
+    char response[768];  // 增大缓冲区
     snprintf(response, sizeof(response),
         "{"
         "\"cursor\":%lu,"
         "\"f1_415nm\":%u,\"f2_445nm\":%u,\"f3_480nm\":%u,\"f4_515nm\":%u,"
         "\"f5_555nm\":%u,\"f6_590nm\":%u,\"f7_630nm\":%u,\"f8_680nm\":%u,"
-        "\"nir\":%u,\"clear\":%u"
+        "\"nir\":%u,\"clear\":%u,"
+        "\"ci\":%.3f,"
+        "\"ppfd\":%.1f,\"par\":%.1f"
         "}",
         (unsigned long)data.cursor,
         data.f1, data.f2, data.f3, data.f4,
         data.f5, data.f6, data.f7, data.f8,
-        data.nir, data.clear);
-    }
+        data.nir, data.clear,
+        data.ci,
+        data.ppfd_plant, data.ppfd_par);
+    
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, strlen(response));
     return ESP_OK;
@@ -596,6 +553,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     httpd_resp_send(req, html, strlen(html));
     return ESP_OK;
 }
+
 static void start_webserver(void)
 {
     httpd_handle_t server = NULL;
@@ -603,52 +561,17 @@ static void start_webserver(void)
     config.server_port = HTTP_PORT;
     config.stack_size = 8192;
     
-    ESP_LOGI(TAG, "Starting HTTP server on port %d...", HTTP_PORT);
-    
-    esp_err_t ret = httpd_start(&server, &config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ httpd_start FAILED: %s (0x%x)", esp_err_to_name(ret), ret);
-        return;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri_root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
+        httpd_uri_t uri_latest = { .uri = "/latest", .method = HTTP_GET, .handler = latest_get_handler };
+        
+        httpd_register_uri_handler(server, &uri_root);
+        httpd_register_uri_handler(server, &uri_latest);
+        
+        ESP_LOGI(TAG, "HTTP server started on port %d", HTTP_PORT);
     }
-    
-    ESP_LOGI(TAG, "✅ httpd_start success, server handle: %p", server);
-    
-    httpd_uri_t uri_root = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = root_get_handler,
-        .user_ctx = NULL
-    };
-    
-    ret = httpd_register_uri_handler(server, &uri_root);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ Failed to register root handler: %s", esp_err_to_name(ret));
-        httpd_stop(server);
-        return;
-    }
-    ESP_LOGI(TAG, "✅ Registered / handler");
-    
-    httpd_uri_t uri_latest = {
-        .uri = "/latest",
-        .method = HTTP_GET,
-        .handler = latest_get_handler,
-        .user_ctx = NULL
-    };
-    
-    ret = httpd_register_uri_handler(server, &uri_latest);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ Failed to register latest handler: %s", esp_err_to_name(ret));
-        httpd_stop(server);
-        return;
-    }
-    ESP_LOGI(TAG, "✅ Registered /latest handler");
-    
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "🌐 HTTP Server READY on port %d", HTTP_PORT);
-    ESP_LOGI(TAG, "   http://192.168.4.1:%d/", HTTP_PORT);
-    ESP_LOGI(TAG, "   http://192.168.4.1:%d/latest", HTTP_PORT);
-    ESP_LOGI(TAG, "========================================");
 }
+
 static void wifi_init_softap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -686,55 +609,41 @@ static void wifi_init_softap(void)
 // ==============================
 // 主函数
 // ==============================
+
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
-    // ... nvs 处理 ...
-
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    
     ESP_LOGI(TAG, "ESP32-C6 + AS7341 - 11-Channel Spectrometer");
-
-    // 1. 先初始化 WiFi（AP 模式）
+    
+    // 初始化PPFD配置
+    ppfd_init(&g_ppfd_config);
+    
     wifi_init_softap();
+    vTaskDelay(pdMS_TO_TICKS(100));
     
-    // 2. 等待 AP 完全建立
-    vTaskDelay(pdMS_TO_TICKS(1000));  // 增加到 1 秒
-    
-    // 3. 初始化 I2C
     ret = i2c_master_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C init failed");
         return;
     }
-
-    // 4. 初始化 AS7341
+    
     ret = as7341_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "AS7341 init failed");
         return;
     }
-
-    // 5. 创建互斥锁
+    
     g_data_mutex = xSemaphoreCreateMutex();
-    if (g_data_mutex == NULL) {
-        ESP_LOGE(TAG, "Mutex creation failed");
-        return;
-    }
-
-    // 6. 启动传感器任务（开始采集数据）
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
     
-    // 7. 等待传感器读出第一批数据
-    vTaskDelay(pdMS_TO_TICKS(2000));  // 等待 2 秒，确保有数据
-    
-    // 8. 最后启动 HTTP 服务器
+    vTaskDelay(pdMS_TO_TICKS(500));
     start_webserver();
     
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "System ready!");
-    ESP_LOGI(TAG, "WiFi: %s", SOFT_AP_SSID);
-    ESP_LOGI(TAG, "URL: http://192.168.4.1/latest");
-    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "System ready - Connect to WiFi: %s", SOFT_AP_SSID);
 }
-
-
- 

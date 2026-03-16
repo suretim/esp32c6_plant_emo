@@ -47,8 +47,18 @@ typedef struct {
     float calibration_k;       // 校准系数
     float reference_ppfd;      // 参考PPFD值
 } ppfd_config_t;
-
-// 数据结构 - AS7341的11通道
+ 
+// 电机状态结构体
+typedef struct {
+    //int current_step;           // 当前步进索引
+    int total_steps;            // 总步数
+    int final_step;
+    int current_step;        // 剩余步数
+    int direction;              // 方向
+    uint32_t step_delay_ms;     // 步间延迟(ms)
+    bool is_running;            // 是否运行中
+    int64_t last_step_time;     // 上一步的时间戳(us)
+} motor_state_t;
 typedef struct {
     uint32_t cursor;
     uint16_t f1;   // 415nm
@@ -65,3 +75,33 @@ typedef struct {
     float ppfd_par;      // 简单PAR估算
     float ppfd_plant;    // 植物响应PPFD
 } sensor_data_t;
+
+// AS7341寄存器
+// #define AS7341_REG_ENABLE          0x80
+// #define AS7341_REG_ID               0x92
+// #define AS7341_REG_STATUS           0x71
+// #define AS7341_REG_CH0_DATA_L       0x95
+// #define AS7341_REG_CFG0             0xB0
+// #define AS7341_REG_CFG1             0xB1
+// #define AS7341_REG_CFG6             0xB5
+// #define AS7341_REG_CFG8             0xB7
+// #define AS7341_REG_CFG9             0xB8
+// #define AS7341_REG_AGAIN            0xA9
+// #define AS7341_REG_ATIME            0x81
+// #define AS7341_REG_ASTEP_L          0x83
+// #define AS7341_REG_ASTEP_H          0x84
+
+// // 控制位
+// #define AS7341_ENABLE_PON           0x01
+// #define AS7341_ENABLE_SPEN          0x02
+// #define AS7341_ENABLE_SMUXEN        0x10
+// #define AS7341_ENABLE_FDEN          0x40
+// #define AS7341_ENABLE_WEN           0x08
+
+// // SMUX命令
+// #define AS7341_SMUX_CMD_WRITE       0x00
+// #define AS7341_SMUX_CMD_READ        0x20
+// #define AS7341_SMUX_CMD_EXEC        0x10
+
+// // 预期芯片ID
+// #define AS7341_EXPECTED_ID          0x24

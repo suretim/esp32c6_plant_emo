@@ -594,9 +594,30 @@ static void start_webserver(void)
 // ==============================
 // 主函数
 // ==============================
-
+void test_hardware_timer(void)
+{
+    ESP_LOGI(TAG, "=== Testing timers ===");
+    
+    // 测试 esp_timer
+    int64_t esp_time1 = esp_timer_get_time();
+    ESP_LOGI(TAG, "esp_timer_get_time(): %lld", esp_time1);
+    
+    // 测试 FreeRTOS tick
+    TickType_t tick1 = xTaskGetTickCount();
+    ESP_LOGI(TAG, "xTaskGetTickCount(): %lu", tick1);
+    
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    
+    int64_t esp_time2 = esp_timer_get_time();
+    TickType_t tick2 = xTaskGetTickCount();
+    
+    ESP_LOGI(TAG, "After 100ms delay:");
+    ESP_LOGI(TAG, "esp_timer delta: %lld us", esp_time2 - esp_time1);
+    ESP_LOGI(TAG, "tick delta: %lu ticks", tick2 - tick1);
+}
 void app_main(void)
 {
+        ESP_ERROR_CHECK(esp_timer_init());
     // 初始化NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -626,7 +647,8 @@ void app_main(void)
     
     // 创建互斥锁
     g_data_mutex = xSemaphoreCreateMutex();
-    
+    test_hardware_timer();
+
     // 启动传感器任务
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
     

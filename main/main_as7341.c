@@ -26,7 +26,7 @@
 #include "esp_http_server.h"
 
 #include "driver/i2c.h"
-
+#include "sensor_data.h"
 #define TAG "AS7341"
 
 // WiFi配置
@@ -44,68 +44,23 @@
 #define I2C_MASTER_TIMEOUT_MS      1000
 
 // AS7341地址
-#define AS7341_ADDR                0x39
+//#define AS7341_ADDR                0x39
 
-// AS7341寄存器
-#define AS7341_REG_ENABLE          0x80
-#define AS7341_REG_ID               0x92
-#define AS7341_REG_STATUS           0x71
-#define AS7341_REG_CH0_DATA_L       0x95
-#define AS7341_REG_CFG0             0xB0
-#define AS7341_REG_CFG1             0xB1
-#define AS7341_REG_CFG6             0xB5
-#define AS7341_REG_CFG8             0xB7
-#define AS7341_REG_CFG9             0xB8
-#define AS7341_REG_AGAIN            0xA9
-#define AS7341_REG_ATIME            0x81
-#define AS7341_REG_ASTEP_L          0x83
-#define AS7341_REG_ASTEP_H          0x84
 
-// 控制位
-#define AS7341_ENABLE_PON           0x01
-#define AS7341_ENABLE_SPEN          0x02
-#define AS7341_ENABLE_SMUXEN        0x10
-#define AS7341_ENABLE_FDEN          0x40
-#define AS7341_ENABLE_WEN           0x08
+//#define DEBUG
+#ifdef DEBUG
+#define AS_LOGI(TAG, format, ...) ESP_LOGI(TAG, format, ##__VA_ARGS__)
+#define AS_LOGD(TAG, format, ...) ESP_LOGI(TAG, format, ##__VA_ARGS__)
+#else
+#define AS_LOGI(TAG, format, ...)
+#define AS_LOGD(TAG, format, ...)
+#endif 
 
-// SMUX命令
-#define AS7341_SMUX_CMD_WRITE       0x00
-#define AS7341_SMUX_CMD_READ        0x20
-#define AS7341_SMUX_CMD_EXEC        0x10
-
-// 预期芯片ID
-#define AS7341_EXPECTED_ID          0x24
-
-// PPFD配置结构体
-typedef struct {
-    float weight_par[8];      // PAR权重
-    float weight_plant[8];     // 植物响应权重
-    float calibration_k;       // 校准系数
-    float reference_ppfd;      // 参考PPFD值
-} ppfd_config_t;
-
-// 数据结构 - AS7341的11通道
-typedef struct {
-    uint32_t cursor;
-    uint16_t f1;   // 415nm
-    uint16_t f2;   // 445nm
-    uint16_t f3;   // 480nm
-    uint16_t f4;   // 515nm
-    uint16_t f5;   // 555nm
-    uint16_t f6;   // 590nm
-    uint16_t f7;   // 630nm
-    uint16_t f8;   // 680nm
-    uint16_t nir;  // 近红外
-    uint16_t clear; // 清除通道
-    float ci;      // 叶绿素指数
-    float ppfd_par;      // 简单PAR估算
-    float ppfd_plant;    // 植物响应PPFD
-} sensor_data_t;
 
 static sensor_data_t g_latest_data = {0};
 static SemaphoreHandle_t g_data_mutex = NULL;
 static ppfd_config_t g_ppfd_config;
-
+sensor_data_t data = {0};
 // ==============================
 // I2C底层操作
 // ==============================
@@ -222,7 +177,7 @@ static esp_err_t as7341_configure_smux(void)
     
     vTaskDelay(pdMS_TO_TICKS(10));
     
-    ESP_LOGI(TAG, "SMUX configured");
+    AS_LOGI(TAG, "SMUX configured");
     return ESP_OK;
 }
 
@@ -237,11 +192,11 @@ static esp_err_t as7341_init(void)
     
     ret = as7341_read_reg(AS7341_REG_ID, &id);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read ID");
+        AS_LOGD(TAG, "Failed to read ID");
         //return ret;
     }
     
-    ESP_LOGI(TAG, "AS7341 ID: 0x%02X", id);
+    AS_LOGI(TAG, "AS7341 ID: 0x%02X", id);
     
     // 软件复位
     ret = as7341_write_reg(AS7341_REG_ENABLE, 0x06);
@@ -278,7 +233,7 @@ static esp_err_t as7341_init(void)
     ret = as7341_write_reg(AS7341_REG_ENABLE, AS7341_ENABLE_PON | AS7341_ENABLE_SMUXEN);
     if (ret != ESP_OK) return ret;
     
-    ESP_LOGI(TAG, "AS7341 initialized");
+    AS_LOGI(TAG, "AS7341 initialized");
     return ESP_OK;
 }
 
@@ -367,7 +322,7 @@ static void ppfd_calculate(sensor_data_t *data)
     // 调试输出
     static int count = 0;
     if (++count % 5 == 0) {
-        ESP_LOGI(TAG, "PPFD weighted sum = %.1f", weighted_sum);
+        AS_LOGI(TAG, "PPFD weighted sum = %.1f", weighted_sum);
     }
     
     // 计算 PPFD
@@ -386,11 +341,11 @@ static void ppfd_calculate(sensor_data_t *data)
 
 static void sensor_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "Sensor task started");
+    AS_LOGI(TAG, "Sensor task started");
     vTaskDelay(pdMS_TO_TICKS(1000));
     
     uint32_t cursor = 0;
-    sensor_data_t data = {0};
+    
     
     while (1) {
         esp_err_t ret = as7341_read_all_channels(&data);
@@ -417,13 +372,15 @@ static void sensor_task(void *pvParameters)
             
             // 打印数据
             if (cursor % 3 == 0) {
-                ESP_LOGI(TAG, "F1=%4u F2=%4u F3=%4u F4=%4u F5=%4u F6=%4u", 
+                AS_LOGI(TAG, "F1=%4u F2=%4u F3=%4u F4=%4u F5=%4u F6=%4u", 
                          data.f1, data.f2, data.f3, data.f4, data.f5, data.f6);
-                ESP_LOGI(TAG, "F7=%4u F8=%4u NIR=%4u Clear=%4u CI=%.3f PPFD=%.1f", 
+                AS_LOGI(TAG, "F7=%4u F8=%4u NIR=%4u Clear=%4u CI=%.3f PPFD=%.1f", 
                          data.f7, data.f8, data.nir, data.clear, data.ci, data.ppfd_plant);
+                //ESP_LOGI(TAG, " CI=%.3f PPFD=%.1f", 
+                //         data.ci, data.ppfd_plant);
             }
         } else {
-            ESP_LOGW(TAG, "Failed to read sensor");
+            AS_LOGD(TAG, "Failed to read sensor");
         }
         
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -609,6 +566,7 @@ static void wifi_init_softap(void)
 // ==============================
 // 主函数
 // ==============================
+extern void task_stepper_motor(void *pvParameters);
 
 void app_main(void)
 {
@@ -644,6 +602,8 @@ void app_main(void)
     
     vTaskDelay(pdMS_TO_TICKS(500));
     start_webserver();
+    xTaskCreate(task_stepper_motor, "task_stepper_motor", 4096, NULL, 5, NULL);
+
     
     ESP_LOGI(TAG, "System ready - Connect to WiFi: %s", SOFT_AP_SSID);
 }

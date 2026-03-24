@@ -7,6 +7,14 @@
 #include "esp_timer.h"
 #include "sensor_data.h"
 static const char *TAG = "STEPPER_MOTOR";
+//#define DEBUG
+#ifdef DEBUG
+#define AS_LOGI(TAG, format, ...) ESP_LOGI(TAG, format, ##__VA_ARGS__)
+#define AS_LOGD(TAG, format, ...) ESP_LOGI(TAG, format, ##__VA_ARGS__)
+#else
+#define AS_LOGI(TAG, format, ...)
+#define AS_LOGD(TAG, format, ...)
+#endif 
 
 // 定义GPIO引脚
 #define IN1 GPIO_NUM_18
@@ -79,7 +87,7 @@ static bool is_motor_running(void)
         cnt_dark = 0;
         cnt_direction = 1;
         first_run = false;
-        ESP_LOGI(TAG, "Static variables reset: cnt_ci=%d", cnt_ci);
+        AS_LOGI(TAG, "Static variables reset: cnt_ci=%d", cnt_ci);
     }
     // 保护临界区
     portENTER_CRITICAL(&spinlock);
@@ -95,10 +103,10 @@ static bool is_motor_running(void)
         //ESP_LOGI(TAG, "Current time (us): %lld", current_time);
         //ESP_LOGI(TAG, "Current time (ms): %lld", current_time / 1000);
         //ESP_LOGI(TAG, "last_step_time: %lld", motor_state.last_step_time);
-        ESP_LOGI(TAG, "cnt_ci: %d", cnt_ci);
-        ESP_LOGI(TAG, "current_step: %d", motor_state.current_step);
-        ESP_LOGI(TAG, "direction: %d", motor_state.direction);
-        ESP_LOGI(TAG, "ci: %f, ppfd: %f", current_ci, current_ppfd);
+        AS_LOGI(TAG, "cnt_ci: %d", cnt_ci);
+        AS_LOGI(TAG, "current_step: %d", motor_state.current_step);
+        AS_LOGI(TAG, "direction: %d", motor_state.direction);
+        AS_LOGI(TAG, "ci: %f, ppfd: %f", current_ci, current_ppfd);
         //ESP_LOGI(TAG, "=== END DEBUG ===");
         cnt_direction = motor_state.direction;
     }
@@ -122,7 +130,7 @@ static bool is_motor_running(void)
             motor_state.current_step =1000;
             //cnt_dark = 0; 
             cnt_ci = 0;
-            printf("ppfd %f \n", current_ppfd);
+            AS_LOGI(TAG,"ppfd %f \n", current_ppfd);
             return true; 
         }
         cnt_dark++;
@@ -143,7 +151,7 @@ static bool is_motor_running(void)
             motor_state.final_step = motor_state.total_steps - 1000;
             motor_state.direction =0;// (motor_state.direction > 0) ? -1 : 1;
             motor_state.is_running = false; 
-            printf("ci %f, cnt_ci %d, current_step:%d direction %d \n",
+            AS_LOGI(TAG,"ci %f, cnt_ci %d, current_step:%d direction %d \n",
                 current_ci,      // 使用局部变量
                 cnt_ci,
                 motor_state.current_step,
@@ -174,7 +182,7 @@ void motor_rotate_non_blocking(int steps, uint32_t delay_ms) {
     motor_state.last_step_time = esp_timer_get_time();
     portEXIT_CRITICAL(&motor_spinlock);
     
-    ESP_LOGI(TAG, "Start motor: total=%d, cur=%d, dir=%d", 
+    AS_LOGI(TAG, "Start motor: total=%d, cur=%d, dir=%d", 
         steps, motor_state.current_step, motor_state.direction);
 }
 
@@ -217,7 +225,7 @@ void motor_update(void) {
         static uint32_t debug_counter = 0;
         if (debug_counter++ % 1000 == 0){
         //if (motor_state.current_step % 1000 == 0) {
-            ESP_LOGI(TAG, "motor_update: cur_step=%d, direction=%d, time_since=%lld", 
+            AS_LOGI(TAG,"motor_update: cur_step=%d, direction=%d, time_since=%lld", 
                 motor_state.current_step, motor_state.direction, time_since_last_step);
         }
     }
@@ -256,7 +264,7 @@ void xmotor_update(void)
 void task_stepper_motor(void *pvParameters)
 {
     motor_gpio_init();
-    ESP_LOGI(TAG, "Stepper Motor Task Started");
+    AS_LOGI(TAG, "Stepper Motor Task Started");
     
     // 等待传感器数据就绪（避免初始0值）
     int wait_count = 0;
@@ -269,15 +277,15 @@ void task_stepper_motor(void *pvParameters)
         portEXIT_CRITICAL(&spinlock);
         
         if (last_ci == 0.0 && last_ppfd == 0.0) {
-            ESP_LOGW(TAG, "Waiting for sensor data... (attempt %d)", ++wait_count);
+            AS_LOGI(TAG,"Waiting for sensor data... (attempt %d)", ++wait_count);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     } while (last_ci == 0.0 && last_ppfd == 0.0 && wait_count < 50); // 最多等待5秒
     
     if (wait_count >= 50) {
-        ESP_LOGE(TAG, "Sensor data timeout! Using default values.");
+        AS_LOGI(TAG,"Sensor data timeout! Using default values.");
     } else {
-        ESP_LOGI(TAG, "Sensor data ready: ci=%.3f, ppfd=%.1f", last_ci, last_ppfd);
+        AS_LOGI(TAG, "Sensor data ready: ci=%.3f, ppfd=%.1f", last_ci, last_ppfd);
     }
     
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -286,7 +294,7 @@ void task_stepper_motor(void *pvParameters)
     motor_state.total_steps=STEPS_PER_REV;
     motor_state.final_step = 1;
     while (1) {
-        ESP_LOGI(TAG, "Starting motor rotation ci=%.3f, ppfd=%.1f", last_ci, last_ppfd);
+        AS_LOGI(TAG, "Starting motor rotation ci=%.3f, ppfd=%.1f", last_ci, last_ppfd);
         motor_rotate_non_blocking(STEPS_PER_REV, 1);
         
         while (motor_state.is_running == true) {   
@@ -300,7 +308,7 @@ void task_stepper_motor(void *pvParameters)
         last_ci = data.ci;
         last_ppfd = data.ppfd_plant;
         portEXIT_CRITICAL(&spinlock);
-        ESP_LOGI(TAG, "stop motor rotation ci=%.3f, ppfd=%.1f", last_ci, last_ppfd);
+        AS_LOGI(TAG,"stop motor rotation ci=%.3f, ppfd=%.1f", last_ci, last_ppfd);
         vTaskDelay(pdMS_TO_TICKS(10000));
         int random_delay = (rand() % 1000) + 500; // 生成500到1500之间的随机数
         if( random_delay >600  ){

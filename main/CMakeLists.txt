@@ -3,6 +3,7 @@ idf_component_register(SRCS
                         "main_as7341.c" 
                         "comprehensive_analysis.cc"  
                         "stepper_motor.c"
+                        "mqtt_server.c"
                     INCLUDE_DIRS "."
                     REQUIRES 
                         esp_http_server 

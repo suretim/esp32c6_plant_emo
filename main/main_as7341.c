@@ -544,7 +544,7 @@ static void wifi_init_softap(void)
             .ssid_len = strlen(SOFT_AP_SSID),
             .password = SOFT_AP_PASSWORD,
             .max_connection = SOFT_AP_MAX_CONN,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK,
+            .authmode = WIFI_AUTH_WPA2_PSK, //   WIFI_AUTH_WPA_WPA2_PSK,
             .channel = SOFT_AP_CHANNEL,
         },
     };
@@ -567,9 +567,10 @@ static void wifi_init_softap(void)
 // 主函数
 // ==============================
 extern void task_stepper_motor(void *pvParameters);
-
+extern void run_mqtt(void);
 void app_main(void)
 {
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -604,6 +605,6 @@ void app_main(void)
     start_webserver();
     xTaskCreate(task_stepper_motor, "task_stepper_motor", 4096, NULL, 5, NULL);
 
-    
+    run_mqtt();
     ESP_LOGI(TAG, "System ready - Connect to WiFi: %s", SOFT_AP_SSID);
 }

@@ -16,19 +16,17 @@
 #include <errno.h>
 
 // ==================== 配置区 ====================
+ 
+ 
+
 #define MQTT_SERVER_PORT 1883
 #define MAX_CLIENTS 10
-#define BUFFER_SIZE 8192
+#define BUFFER_SIZE 8192           // 处理缓冲区 8KB
 #define MAX_SUBSCRIPTIONS 100
 #define MAX_TOPIC_LEN 128
-#define RECV_BUFFER_SIZE 8192
-#define MQTT_CLIENT_STACK_SIZE 16384
-
-// ==================== 分片配置 ====================
-#define SHARD_SIZE 1024  // 每个分片大小（字节）
-#define MAX_FRAGMENT_RETRY 3
-#define FRAGMENT_TIMEOUT_MS 5000
-
+#define RECV_BUFFER_SIZE 8192      // 接收缓冲区 16KB（足够容纳最大报文）
+#define MQTT_CLIENT_STACK_SIZE 16384 // 任务栈 8KB
+ 
 // MQTT协议常量
 #define MQTT_CONNECT     0x10
 #define MQTT_CONNACK     0x20
@@ -51,11 +49,14 @@ static esp_netif_t *wifi_sta_netif = NULL;
 static bool wifi_connected = false;
 static bool static_ip_configured = false;
 
-// ==================== 客户端管理 ====================
+
+
+// ==================== 客户端管理（接收缓冲区在堆上） ====================
 typedef struct mqtt_client {
     int fd;
     bool connected;
     struct mqtt_client *next;
+    // 接收缓冲区 - 改为指针，在堆上分配
     uint8_t *recv_buffer;
     int recv_buffer_len;
     int recv_buffer_capacity;
@@ -76,19 +77,6 @@ static subscription_t *subscriptions = NULL;
 static int subscription_count = 0;
 static SemaphoreHandle_t subscriptions_mutex = NULL;
 
-// ==================== 分片状态管理 ====================
-typedef struct fragment_state {
-    uint16_t msg_id;
-    int total_frags;
-    int sent_frags;
-    int *sent_status;
-    uint32_t timestamp;
-    struct fragment_state *next;
-} fragment_state_t;
-
-static fragment_state_t *active_fragments = NULL;
-static SemaphoreHandle_t fragment_mutex = NULL;
-
 // ==================== 函数声明 ====================
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
@@ -105,54 +93,73 @@ static void forward_to_subscribers(int sender_fd, const char *topic, uint8_t *da
 static void handle_subscribe(int client_fd, uint8_t *buffer, int len);
 static char* parse_publish_topic(uint8_t *buffer, int len, int *topic_len_out);
 static int read_mqtt_packet(mqtt_client_t *client, uint8_t *out_buffer, int max_len);
-static bool send_mqtt_fragment(int client_fd, const char *base_topic, uint16_t msg_id, 
-                                int fragment_idx, int total_frags, const uint8_t *data, int data_len);
-static bool send_fragmented_mqtt(int client_fd, const char *topic, const uint8_t *data, int data_len);
-static bool send_mqtt_direct(int client_fd, const char *topic, const uint8_t *data, int data_len, int qos);
-static bool mqtt_publish_with_fragmentation(int client_fd, const char *topic, const uint8_t *data, int data_len);
 
 // ==================== MQTT主题匹配 ====================
-static bool mqtt_topic_match(const char *filter, const char *topic) {
+  static bool mqtt_topic_match(const char *filter, const char *topic) {
     if (filter == NULL || topic == NULL) {
         return false;
     }
     
+    // 1. 完全匹配
+    if (strcmp(filter, topic) == 0) {
+        return true;
+    }
+    
+    // 2. 单层通配符 "+" 匹配一个层级
+    if (strcmp(filter, "+") == 0) {
+        return (strchr(topic, '/') == NULL);
+    }
+    
+    // 3. 多层通配符 "#" 匹配所有
     if (strcmp(filter, "#") == 0) {
         return true;
     }
     
+    // 4. 处理以 "/#" 结尾的过滤器，如 "grpc_sub/weights/#"
     size_t filter_len = strlen(filter);
-    if (filter_len >= 2 && filter[filter_len - 1] == '#' && filter[filter_len - 2] == '/') {
-        char base_filter[MAX_TOPIC_LEN];
-        strncpy(base_filter, filter, filter_len - 2);
-        base_filter[filter_len - 2] = '\0';
-        
-        if (strncmp(topic, base_filter, filter_len - 2) == 0) {
-            return true;
+    if (filter_len > 1 && filter[filter_len - 1] == '#') {
+        // 检查是否以 "/#" 结尾
+        if (filter[filter_len - 2] == '/') {
+            // 提取基础路径（去掉末尾的 "/#"）
+            char base_path[MAX_TOPIC_LEN];
+            size_t base_len = filter_len - 2;
+            strncpy(base_path, filter, base_len);
+            base_path[base_len] = '\0';
+            
+            // 检查主题是否以基础路径开头
+            if (strncmp(topic, base_path, base_len) == 0) {
+                // 主题等于基础路径，或者基础路径后面还有内容
+                return true;
+            }
+            return false;
         }
-        return false;
     }
     
+    // 5. 逐层匹配（处理包含 "+" 的情况）
     const char *f = filter;
     const char *t = topic;
     
     while (*f && *t) {
-        if (*f == '#') {
-            return (*(f + 1) == '\0');
-        }
-        
         if (*f == '+') {
+            // "+" 匹配一个层级：跳过直到下一个 "/" 或结尾
             f++;
             while (*t && *t != '/') {
                 t++;
             }
+            // 如果过滤器还有下一个字符且是 '/'，跳过主题中的 '/'
             if (*f == '/' && *t == '/') {
-                t++;
                 f++;
+                t++;
             }
             continue;
         }
         
+        if (*f == '#') {
+            // "#" 必须出现在末尾，匹配剩余所有
+            return (*(f + 1) == '\0');
+        }
+        
+        // 普通字符必须完全匹配
         if (*f != *t) {
             return false;
         }
@@ -161,22 +168,28 @@ static bool mqtt_topic_match(const char *filter, const char *topic) {
         t++;
     }
     
-    if (*f == '\0' && *t == '\0') {
-        return true;
+    // 6. 处理过滤器结束但主题还有内容的情况
+    if (*f == '\0') {
+        // 过滤器结束，主题必须也结束
+        return (*t == '\0');
     }
     
+    // 7. 处理过滤器以 "#" 结尾的情况（前面没匹配到的情况）
     if (*f == '#' && *(f + 1) == '\0') {
         return true;
     }
     
+    // 8. 处理过滤器以 "+" 结尾的情况
     if (*f == '+' && *(f + 1) == '\0') {
-        return true;
+        // "+" 匹配剩余一个层级，检查主题是否还有内容
+        return (*t != '\0');
     }
     
     return false;
 }
 
-// ==================== 客户端管理 ====================
+
+// ==================== 客户端管理（带缓冲区） ====================
 static void remove_client_subscriptions(int client_fd) {
     if (subscriptions_mutex == NULL) return;
     
@@ -208,7 +221,9 @@ static void remove_client_subscriptions(int client_fd) {
     
     xSemaphoreGive(subscriptions_mutex);
 }
+ 
 
+// ==================== 添加客户端（分配堆内存） ====================
 static mqtt_client_t* add_client(int fd) {
     portENTER_CRITICAL(&client_lock);
     
@@ -229,6 +244,7 @@ static mqtt_client_t* add_client(int fd) {
         new_client->connected = true;
         new_client->recv_buffer_len = 0;
         new_client->recv_buffer_capacity = RECV_BUFFER_SIZE;
+        // 在堆上分配接收缓冲区
         new_client->recv_buffer = (uint8_t *)malloc(RECV_BUFFER_SIZE);
         if (!new_client->recv_buffer) {
             ESP_LOGE(TAG, "分配接收缓冲区失败");
@@ -244,6 +260,7 @@ static mqtt_client_t* add_client(int fd) {
     return new_client;
 }
 
+// ==================== 移除客户端（释放堆内存） ====================
 static void remove_client(int fd) {
     portENTER_CRITICAL(&client_lock);
     
@@ -257,6 +274,7 @@ static void remove_client(int fd) {
             } else {
                 client_list = curr->next;
             }
+            // 释放接收缓冲区
             if (curr->recv_buffer) {
                 free(curr->recv_buffer);
             }
@@ -271,26 +289,28 @@ static void remove_client(int fd) {
     remove_client_subscriptions(fd);
 }
 
-// ==================== 读取完整 MQTT 报文 ====================
+// ==================== 读取完整 MQTT 报文（使用堆缓冲区） ====================
 static int read_mqtt_packet(mqtt_client_t *client, uint8_t *out_buffer, int max_len) {
     int fd = client->fd;
     uint8_t *buffer = client->recv_buffer;
     int *buf_len = &client->recv_buffer_len;
     int capacity = client->recv_buffer_capacity;
     
+    // 从 socket 读取数据
     uint8_t tmp[BUFFER_SIZE];
     ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
     
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return 0;
+            return 0;  // 无数据，稍后重试
         }
-        return -1;
+        return -1;  // 错误
     }
     if (n == 0) {
-        return -1;
+        return -1;  // 连接关闭
     }
     
+    // 追加到缓冲区
     if (*buf_len + n > capacity) {
         ESP_LOGW(TAG, "缓冲区溢出，清空 fd=%d", fd);
         *buf_len = 0;
@@ -299,6 +319,7 @@ static int read_mqtt_packet(mqtt_client_t *client, uint8_t *out_buffer, int max_
     memcpy(buffer + *buf_len, tmp, n);
     *buf_len += n;
     
+    // 尝试解析完整报文
     int pos = 0;
     while (pos < *buf_len) {
         if (pos + 1 > *buf_len) break;
@@ -342,219 +363,6 @@ static int read_mqtt_packet(mqtt_client_t *client, uint8_t *out_buffer, int max_
     
     return 0;
 }
-
-// ==================== 分片发送函数 ====================
-static bool send_mqtt_fragment(int client_fd, const char *base_topic, uint16_t msg_id, 
-                                int fragment_idx, int total_frags, const uint8_t *data, int data_len) {
-    char frag_topic[256];
-    
-    snprintf(frag_topic, sizeof(frag_topic), "%s/frag/%d/%d/%d", 
-             base_topic, msg_id, fragment_idx, total_frags);
-    
-    int topic_len = strlen(frag_topic);
-    int packet_len = 1 + 4 + 2 + topic_len + 2 + data_len;
-    uint8_t *packet = (uint8_t *)malloc(packet_len);
-    
-    if (!packet) {
-        ESP_LOGE("MQTT_FRAG", "分配内存失败");
-        return false;
-    }
-    
-    int pos = 0;
-    packet[pos++] = MQTT_PUBLISH | (1 << 1);
-    
-    int remaining_len = 2 + topic_len + 2 + data_len;
-    int rem_len_pos = pos;
-    pos++;
-    
-    int rem_len = remaining_len;
-    while (1) {
-        uint8_t digit = rem_len % 128;
-        rem_len /= 128;
-        if (rem_len > 0) digit |= 0x80;
-        packet[pos++] = digit;
-        if (rem_len == 0) break;
-    }
-    
-    int rem_len_bytes = pos - rem_len_pos - 1;
-    pos = rem_len_pos + rem_len_bytes + 1;
-    
-    packet[pos++] = (topic_len >> 8) & 0xFF;
-    packet[pos++] = topic_len & 0xFF;
-    memcpy(packet + pos, frag_topic, topic_len);
-    pos += topic_len;
-    
-    packet[pos++] = (msg_id >> 8) & 0xFF;
-    packet[pos++] = msg_id & 0xFF;
-    
-    memcpy(packet + pos, data, data_len);
-    pos += data_len;
-    
-    ssize_t sent = send(client_fd, packet, pos, 0);
-    free(packet);
-    
-    if (sent == pos) {
-        ESP_LOGI("MQTT_FRAG", "✅ 发送分片 %d/%d (msg_id=%d, %d bytes)", 
-                 fragment_idx + 1, total_frags, msg_id, data_len);
-        return true;
-    } else {
-        ESP_LOGE("MQTT_FRAG", "❌ 发送分片失败 %d/%d, sent=%d, expected=%d", 
-                 fragment_idx + 1, total_frags, sent, pos);
-        return false;
-    }
-}
-
-static bool send_fragmented_mqtt(int client_fd, const char *topic, const uint8_t *data, int data_len) {
-    if (data_len <= 0) {
-        ESP_LOGE("MQTT_FRAG", "数据为空");
-        return false;
-    }
-    
-    static uint16_t next_msg_id = 1;
-    uint16_t msg_id = next_msg_id++;
-    
-    int total_frags = (data_len + SHARD_SIZE - 1) / SHARD_SIZE;
-    ESP_LOGI("MQTT_FRAG", "开始分片发送: msg_id=%d, total=%d, total_size=%d", 
-             msg_id, total_frags, data_len);
-    
-    for (int i = 0; i < total_frags; i++) {
-        int offset = i * SHARD_SIZE;
-        int frag_size = (i == total_frags - 1) ? (data_len - offset) : SHARD_SIZE;
-        
-        bool sent = false;
-        for (int retry = 0; retry < MAX_FRAGMENT_RETRY; retry++) {
-            if (send_mqtt_fragment(client_fd, topic, msg_id, i, total_frags, 
-                                   data + offset, frag_size)) {
-                sent = true;
-                break;
-            }
-            ESP_LOGW("MQTT_FRAG", "分片 %d 发送失败，重试 %d/%d", i + 1, retry + 1, MAX_FRAGMENT_RETRY);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        if (!sent) {
-            ESP_LOGE("MQTT_FRAG", "分片 %d 发送失败，放弃整个消息", i + 1);
-            return false;
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    
-    char complete_topic[256];
-    snprintf(complete_topic, sizeof(complete_topic), "%s/frag/complete", topic);
-    
-    int complete_topic_len = strlen(complete_topic);
-    int complete_packet_len = 1 + 4 + 2 + complete_topic_len + 1;
-    uint8_t *complete_packet = (uint8_t *)malloc(complete_packet_len);
-    
-    if (complete_packet) {
-        int pos = 0;
-        complete_packet[pos++] = MQTT_PUBLISH;
-        
-        int remaining_len = 2 + complete_topic_len + 1;
-        int rem_len_pos = pos;
-        pos++;
-        
-        int rem_len = remaining_len;
-        while (1) {
-            uint8_t digit = rem_len % 128;
-            rem_len /= 128;
-            if (rem_len > 0) digit |= 0x80;
-            complete_packet[pos++] = digit;
-            if (rem_len == 0) break;
-        }
-        
-        int rem_len_bytes = pos - rem_len_pos - 1;
-        pos = rem_len_pos + rem_len_bytes + 1;
-        
-        complete_packet[pos++] = (complete_topic_len >> 8) & 0xFF;
-        complete_packet[pos++] = complete_topic_len & 0xFF;
-        memcpy(complete_packet + pos, complete_topic, complete_topic_len);
-        pos += complete_topic_len;
-        complete_packet[pos++] = 0x01;
-        
-        send(client_fd, complete_packet, pos, 0);
-        free(complete_packet);
-        ESP_LOGI("MQTT_FRAG", "✅ 发送完成通知");
-    }
-    
-    ESP_LOGI("MQTT_FRAG", "✅ 所有分片发送完成 (msg_id=%d, %d fragments)", msg_id, total_frags);
-    return true;
-}
-
-static bool send_mqtt_direct(int client_fd, const char *topic, const uint8_t *data, int data_len, int qos) {
-    int topic_len = strlen(topic);
-    int packet_len = 1 + 4 + 2 + topic_len + (qos > 0 ? 2 : 0) + data_len;
-    uint8_t *packet = (uint8_t *)malloc(packet_len);
-    
-    if (!packet) {
-        ESP_LOGE("MQTT_DIRECT", "分配内存失败");
-        return false;
-    }
-    
-    int pos = 0;
-    packet[pos++] = MQTT_PUBLISH | (qos << 1);
-    
-    int remaining_len = 2 + topic_len + (qos > 0 ? 2 : 0) + data_len;
-    int rem_len_pos = pos;
-    pos++;
-    
-    int rem_len = remaining_len;
-    while (1) {
-        uint8_t digit = rem_len % 128;
-        rem_len /= 128;
-        if (rem_len > 0) digit |= 0x80;
-        packet[pos++] = digit;
-        if (rem_len == 0) break;
-    }
-    
-    int rem_len_bytes = pos - rem_len_pos - 1;
-    pos = rem_len_pos + rem_len_bytes + 1;
-    
-    packet[pos++] = (topic_len >> 8) & 0xFF;
-    packet[pos++] = topic_len & 0xFF;
-    memcpy(packet + pos, topic, topic_len);
-    pos += topic_len;
-    
-    if (qos > 0) {
-        static uint16_t next_packet_id = 1;
-        uint16_t packet_id = next_packet_id++;
-        packet[pos++] = (packet_id >> 8) & 0xFF;
-        packet[pos++] = packet_id & 0xFF;
-    }
-    
-    memcpy(packet + pos, data, data_len);
-    pos += data_len;
-    
-    ssize_t sent = send(client_fd, packet, pos, 0);
-    free(packet);
-    
-    if (sent == pos) {
-        ESP_LOGI("MQTT_DIRECT", "✅ 直接发送成功: %s (%d bytes)", topic, data_len);
-        return true;
-    } else {
-        ESP_LOGE("MQTT_DIRECT", "❌ 直接发送失败: %s, sent=%d", topic, sent);
-        return false;
-    }
-}
-
-static bool mqtt_publish_with_fragmentation(int client_fd, const char *topic, const uint8_t *data, int data_len) {
-    ESP_LOGI("MQTT_PUB", "准备发布: topic=%s, size=%d bytes", topic, data_len);
-    
-    if (data_len <= 0) {
-        ESP_LOGE("MQTT_PUB", "数据为空");
-        return false;
-    }
-    
-    if (data_len <= SHARD_SIZE) {
-        ESP_LOGI("MQTT_PUB", "数据较小，直接发送");
-        return send_mqtt_direct(client_fd, topic, data, data_len, 1);
-    } else {
-        ESP_LOGI("MQTT_PUB", "数据较大，使用分片发送 (size=%d > %d)", data_len, SHARD_SIZE);
-        return send_fragmented_mqtt(client_fd, topic, data, data_len);
-    }
-}
-
 // ==================== PUBLISH 处理函数 ====================
 static void handle_publish_with_base64_check(int client_fd, uint8_t *buffer, int recv_len) {
     char *topic = parse_publish_topic(buffer, recv_len, NULL);
@@ -562,12 +370,14 @@ static void handle_publish_with_base64_check(int client_fd, uint8_t *buffer, int
              client_fd, topic ? topic : "unknown", recv_len);
     
     if (topic) {
+        // 转发数据
         forward_to_subscribers(client_fd, topic, buffer, recv_len);
         free(topic);
     } else {
         forward_to_subscribers(client_fd, "unknown", buffer, recv_len);
     }
     
+    // 发送 PUBACK (QoS 1)
     uint8_t qos = (buffer[0] & 0x06) >> 1;
     if (qos == 1) {
         uint16_t packet_id = 0;
@@ -586,7 +396,10 @@ static void handle_publish_with_base64_check(int client_fd, uint8_t *buffer, int
     }
 }
 
-// ==================== MQTT客户端处理 ====================
+ 
+// ==================== 修改后的 mqtt_client_handler ====================
+
+// ==================== 修改后的 mqtt_client_handler ====================
 static void mqtt_client_handler(void *arg) {
     int client_fd = (int)(uintptr_t)arg;
     
@@ -609,11 +422,13 @@ static void mqtt_client_handler(void *arg) {
     int recv_len;
     ESP_LOGI(TAG, "🔌 新客户端 fd=%d", client_fd);
     
+    // 设置 socket 为非阻塞
     int flags = fcntl(client_fd, F_GETFL, 0);
     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
     
+    // ========== 添加：等待数据到达 ==========
     int wait_count = 0;
-    while (wait_count < 50) {
+    while (wait_count < 50) {  // 等待最多 5 秒
         recv_len = read_mqtt_packet(client, buffer, BUFFER_SIZE);
         if (recv_len > 0) break;
         if (recv_len < 0) {
@@ -623,14 +438,17 @@ static void mqtt_client_handler(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(100));
         wait_count++;
     }
+    // =======================================
     
     ESP_LOGI(TAG, "读取 CONNECT 报文结果: recv_len=%d", recv_len);
     
     if (recv_len <= 0) {
+        // ========== 添加：打印接收到的原始数据（如果有） ==========
         if (client->recv_buffer_len > 0) {
             ESP_LOGI(TAG, "缓冲区有 %d 字节数据:", client->recv_buffer_len);
             ESP_LOG_BUFFER_HEX("RAW", client->recv_buffer, client->recv_buffer_len > 64 ? 64 : client->recv_buffer_len);
         }
+        // ======================================================
         
         if (recv_len == 0) {
             ESP_LOGI(TAG, "客户端 fd=%d 未发送CONNECT就断开", client_fd);
@@ -644,15 +462,20 @@ static void mqtt_client_handler(void *arg) {
         return;
     }
     
+    // 打印接收到的 CONNECT 报文前 64 字节
     ESP_LOGI(TAG, "收到 CONNECT 报文 (长度=%d):", recv_len);
     ESP_LOG_BUFFER_HEX("CONNECT", buffer, recv_len > 64 ? 64 : recv_len);
     
+    // 解析 CONNECT 报文
     int parse_result = mqtt_parse_connect(buffer, recv_len);
     ESP_LOGI(TAG, "CONNECT 解析结果: %s", parse_result == 0 ? "成功" : "失败");
     
     if (parse_result == 0) {
+        // 发送 CONNACK
         mqtt_send_connack(client_fd, 0);
         ESP_LOGI(TAG, "✅ 认证成功 fd=%d, CONNACK已发送", client_fd);
+        
+        // 等待一下确保 CONNACK 被发送
         vTaskDelay(pdMS_TO_TICKS(100));
     } else {
         ESP_LOGE(TAG, "❌ 认证失败 fd=%d, 发送拒绝", client_fd);
@@ -664,6 +487,7 @@ static void mqtt_client_handler(void *arg) {
         return;
     }
     
+    // 主循环
     while (1) {
         recv_len = read_mqtt_packet(client, buffer, BUFFER_SIZE);
         
@@ -709,12 +533,12 @@ static void mqtt_client_handler(void *arg) {
     }
 
 cleanup:
-    free(buffer);
+    free(buffer);  // 释放处理缓冲区
     remove_client(client_fd);
     close(client_fd);
     ESP_LOGI(TAG, "关闭 fd=%d", client_fd);
     vTaskDelete(NULL);
-}
+} 
 
 // ==================== MQTT服务器任务 ====================
 static void mqtt_server_task(void *arg) {
@@ -759,13 +583,15 @@ static void mqtt_server_task(void *arg) {
 
         ESP_LOGI(TAG, "🔌 新客户端: %s:%d", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-        if (xTaskCreate(mqtt_client_handler, "mqtt_client", MQTT_CLIENT_STACK_SIZE, 
+        // 使用默认栈大小（因为大缓冲区在堆上）
+        if (xTaskCreate(mqtt_client_handler, "mqtt_client", MQTT_CLIENT_STACK_SIZE , 
                         (void*)(uintptr_t)client_fd, 5, NULL) != pdPASS) {
             ESP_LOGE(TAG, "创建客户端任务失败");
             close(client_fd);
         }
     }
 }
+
 
 // ==================== 订阅管理 ====================
 static void add_subscription(int client_fd, const char *topic, int qos) {
@@ -808,6 +634,7 @@ static void add_subscription(int client_fd, const char *topic, int qos) {
     xSemaphoreGive(subscriptions_mutex);
 }
 
+
 static void forward_to_subscribers(int sender_fd, const char *topic, uint8_t *data, int len) {
     if (subscriptions_mutex == NULL || topic == NULL) return;
     
@@ -818,16 +645,19 @@ static void forward_to_subscribers(int sender_fd, const char *topic, uint8_t *da
         return;
     }
     
+    // 打印当前所有订阅
     ESP_LOGI(TAG, "=== 当前订阅列表 ===");
-    subscription_t *curr = subscriptions;
+    subscription_t *curr = subscriptions;  // 使用不同的变量名
     while (curr) {
         ESP_LOGI(TAG, "  订阅: fd=%d, topic='%s'", curr->client_fd, curr->topic);
         curr = curr->next;
     }
     ESP_LOGI(TAG, "==================");
     
+    // 打印收到的主题
     ESP_LOGI(TAG, "收到 PUBLISH 主题: '%s'", topic);
     
+    // 重新开始遍历 - 使用新的变量
     curr = subscriptions;
     while (curr) {
         if (curr->client_fd != sender_fd && curr->client_fd > 0) {
@@ -835,13 +665,12 @@ static void forward_to_subscribers(int sender_fd, const char *topic, uint8_t *da
             ESP_LOGI(TAG, "检查 fd=%d, sub='%s', topic='%s', match=%d", 
                      curr->client_fd, curr->topic, topic, match);
             if (match) {
-                // 使用分片发送转发数据
-                bool success = mqtt_publish_with_fragmentation(curr->client_fd, topic, data, len);
-                if (success) {
+                ssize_t sent = send(curr->client_fd, data, len, 0);
+                if (sent == len) {
                     forwarded++;
                     ESP_LOGI(TAG, "  ✅ 转发到 fd=%d (%d bytes)", curr->client_fd, len);
                 } else {
-                    ESP_LOGW(TAG, "  ❌ 转发失败 fd=%d", curr->client_fd);
+                    ESP_LOGW(TAG, "  ❌ 转发失败 fd=%d, sent=%d, len=%d", curr->client_fd, sent, len);
                 }
             }
         }
@@ -903,8 +732,6 @@ static void handle_subscribe(int client_fd, uint8_t *buffer, int len) {
     uint16_t packet_id = (buffer[pos] << 8) | buffer[pos + 1];
     pos += 2;
     
-    ESP_LOGI(TAG, "📥 收到 SUBSCRIBE 报文, packet_id=%d, 剩余长度=%d", packet_id, remaining_length);
-    
     int payload_len = len - pos;
     int sub_pos = 0;
     uint8_t return_codes[10] = {0};
@@ -925,17 +752,9 @@ static void handle_subscribe(int client_fd, uint8_t *buffer, int len) {
         uint8_t qos = buffer[pos + sub_pos] & 0x03;
         sub_pos++;
         
-        ESP_LOGI(TAG, "📝 客户端 fd=%d 订阅: '%s' QoS=%d", client_fd, topic, qos);
+        ESP_LOGI(TAG, "📝 订阅: '%s' QoS=%d", topic, qos);
         add_subscription(client_fd, topic, qos);
         return_codes[return_count++] = qos;
-        
-        // 立即打印当前所有订阅
-        ESP_LOGI(TAG, "当前订阅总数: %d", subscription_count);
-        subscription_t *sub = subscriptions;
-        while (sub) {
-            ESP_LOGI(TAG, "  - fd=%d, topic='%s'", sub->client_fd, sub->topic);
-            sub = sub->next;
-        }
     }
     
     uint8_t suback[100];
@@ -946,11 +765,10 @@ static void handle_subscribe(int client_fd, uint8_t *buffer, int len) {
     memcpy(suback + 4, return_codes, return_count);
     
     send(client_fd, suback, 4 + return_count, 0);
-    ESP_LOGI(TAG, "✅ SUBACK发送成功, packet_id=%d, 返回码数量=%d", packet_id, return_count);
+    ESP_LOGI(TAG, "✅ SUBACK发送成功");
 }
 
-
-
+// ==================== MQTT报文解析 ====================
 static int mqtt_parse_remaining_length(uint8_t *buf, int len, int *offset) {
     int multiplier = 1;
     int remaining_length = 0;
@@ -997,6 +815,19 @@ static void mqtt_send_connack(int client_fd, uint8_t return_code) {
     send(client_fd, connack, sizeof(connack), 0);
 }
 
+// ==================== Base64 检查函数 ====================
+static bool is_valid_base64_char(char c) {
+    return ((c >= 'A' && c <= 'Z') || 
+            (c >= 'a' && c <= 'z') || 
+            (c >= '0' && c <= '9') || 
+            c == '+' || c == '/' || c == '=');
+}
+
+
+
+
+
+
 // ==================== 事件处理 ====================
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_id == WIFI_EVENT_STA_START) {
@@ -1023,12 +854,6 @@ void run_mqtt(void) {
     subscriptions_mutex = xSemaphoreCreateMutex();
     if (subscriptions_mutex == NULL) {
         ESP_LOGE(TAG, "创建订阅锁失败");
-        return;
-    }
-    
-    fragment_mutex = xSemaphoreCreateMutex();
-    if (fragment_mutex == NULL) {
-        ESP_LOGE(TAG, "创建分片锁失败");
         return;
     }
     
